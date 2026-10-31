@@ -1,0 +1,22 @@
+# --- Python & Environment Artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.env
+
+# --- IDE & Editor Settings ---
+.vscode/
+.DS_Store
+.idea/
+
+# --- Heavy Project Artifacts & Data ---
+datasets/
+checkpoints/
+results/
+*.pt
+*.log
