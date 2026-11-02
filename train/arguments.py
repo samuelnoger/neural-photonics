@@ -31,8 +31,8 @@ def get_args(custom_args=None):
     # Random Geometry & Dataset Generation (data/data.py)
     data = parser.add_argument_group("Dataset Generation")
     data.add_argument("--save-dir", type=str, default="datasets", help="Directory to save/load train.pt and val.pt")
-    data.add_argument("--n-train", type=int, default=2500, help="Number of training simulations to generate")
-    data.add_argument("--n-val", type=int, default=300, help="Number of validation simulations to generate")
+    data.add_argument("--n-train", type=int, default=20000, help="Number of training simulations to generate")
+    data.add_argument("--n-val", type=int, default=2000, help="Number of validation simulations to generate")
     data.add_argument("--n-jobs", type=int, default=-1, help="Number of CPU cores for parallel solving (-1 = all cores)")
     data.add_argument("--seed", type=int, default=42, help="Base random seed for reproducibility")
 
