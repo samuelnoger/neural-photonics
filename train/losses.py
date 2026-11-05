@@ -1,19 +1,37 @@
 import torch
 import torch.nn.functional as F
 
-def field_loss(pred, target, grad_weight=0.2):
-    """MSE loss on field values + finite-difference spatial gradients (dE/dx, dE/dy)."""
-    mse = F.mse_loss(pred, target)
+def field_loss(pred, target, grad_weight=0.2, port_weight=0.5, x_meas=100):
+    # 1. Direct Relative L2 loss per sample (matches evaluation metric!)
+    diff_norm = torch.linalg.vector_norm(pred - target, dim=(1, 2, 3))
+    true_norm = torch.linalg.vector_norm(target, dim=(1, 2, 3)) + 1e-8
+    rel_l2 = (diff_norm / true_norm).mean()
+
+    # Port measurement slice supervision (x_meas - 1 : x_meas + 2)
+    port_diff = torch.linalg.vector_norm(
+        pred[:, :, x_meas - 1 : x_meas + 2, :] - target[:, :, x_meas - 1 : x_meas + 2, :],
+        dim=(1, 2, 3),
+    )
+    port_true = torch.linalg.vector_norm(
+        target[:, :, x_meas - 1 : x_meas + 2, :], dim=(1, 2, 3)
+    ) + 1e-8
+    port_loss = (port_diff / port_true).mean()
+
+    total = rel_l2 + port_weight * port_loss
     if grad_weight <= 0.0:
-        return mse
+        return total
 
     dx_pred = pred[:, :, 1:, :] - pred[:, :, :-1, :]
     dx_targ = target[:, :, 1:, :] - target[:, :, :-1, :]
     dy_pred = pred[:, :, :, 1:] - pred[:, :, :, :-1]
     dy_targ = target[:, :, :, 1:] - target[:, :, :, :-1]
 
-    grad_mse = F.mse_loss(dx_pred, dx_targ) + F.mse_loss(dy_pred, dy_targ)
-    return mse + grad_weight * grad_mse
+    grad_l2 = (
+        torch.linalg.vector_norm(dx_pred - dx_targ, dim=(1, 2, 3)) / true_norm
+        + torch.linalg.vector_norm(dy_pred - dy_targ, dim=(1, 2, 3)) / true_norm
+    ).mean()
+
+    return total + grad_weight * grad_l2
 
 
 @torch.no_grad()

@@ -5,7 +5,6 @@ import scipy.sparse.linalg as spla
 from matplotlib import pyplot as plt
 
 from train.arguments import get_args
-from verification.plotting import plot_field
 
 
 class HelmholtzSolver2D:
@@ -118,7 +117,7 @@ class HelmholtzSolver2D:
         yc_f = (self.ny - 1) / 2
 
         g = lambda c: (lambda v: v / np.linalg.norm(v))(np.exp(-0.5 * ((y_grid - c) / waist) ** 2))
-        
+
         self.mode_in, self.mode_p1, self.mode_p2 = g(yc_f), g(yc_f - self.port_offset), g(yc_f + self.port_offset)
 
         self.source = np.zeros((self.nx, self.ny), dtype=np.complex128)
@@ -159,6 +158,8 @@ class HelmholtzSolver2D:
 
 
 if __name__ == "__main__":
+    from verification.plotting import plot_field
+
     args = get_args()
     solver = HelmholtzSolver2D.from_args(args)
 

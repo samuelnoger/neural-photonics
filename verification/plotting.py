@@ -55,3 +55,51 @@ def plot_field(Ez, eps=None, solver=None, title="", axes=None):
     axes[1].set_title(f"{head}|Ez|$^2$")
     axes[0].set_ylabel(f"y ({unit})")
     return axes
+
+
+def plot_result(result):
+    """Visualizes the optimized geometry, convergence history, and Surrogate vs. FDFD fields."""
+    fig, axes_grid = plt.subplots(2, 2, figsize=(12, 10))
+    axes = axes_grid.flatten()  # Flattens 2x2 grid into [ax0, ax1, ax2, ax3]
+
+    # Optimized Silicon Geometry
+    axes[0].imshow(result["eps_norm"].T, cmap="Greys", origin="lower")
+    axes[0].set_title("Optimized Silicon Topology")
+
+    # Optimization Trajectory
+    h = result["history"]
+    axes[1].plot(np.array(h["t1_surr"]) * 100, label="Port 1 (%)", lw=2)
+    axes[1].plot(np.array(h["t2_surr"]) * 100, label="Port 2 (%)", lw=2)
+    axes[1].plot(np.array(h["total_surr"]) * 100, "--", color="black", label="Total (%)")
+    axes[1].set_xlabel("Optimization Step")
+    axes[1].set_ylabel("Guided Port Power (%)")
+    axes[1].set_title("Inverse Design Convergence")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    # Surrogate Predicted Intensity
+    int_surr = np.abs(result["Ez_surr"]) ** 2
+    vmax = np.percentile(int_surr, 99.5)
+    axes[2].imshow(int_surr.T, cmap="magma", vmin=0, vmax=vmax, origin="lower")
+    axes[2].set_title(
+        f"FNO Surrogate |Ez|²\nP1={result['t1_surr']*100:.1f}%, P2={result['t2_surr']*100:.1f}%"
+    )
+    eps_grid = result["eps_norm"]
+    axes[2].contour(eps_grid.T, levels=[0.5], colors=["cyan"], linewidths=[1.0], alpha=0.5)
+
+    # 3. True FDFD Verified Intensity
+    if "Ez_true" in result:
+        int_true = np.abs(result["Ez_true"]) ** 2
+        vmax_t = np.percentile(int_true, 99.5)
+        axes[3].imshow(int_true.T, cmap="magma", vmin=0, vmax=vmax_t, origin="lower")
+        axes[3].set_title(
+            f"FDFD Ground-Truth |Ez|²\nP1={result['t1_true']*100:.1f}%, P2={result['t2_true']*100:.1f}%"
+        )
+        axes[3].contour(eps_grid.T, levels=[0.5], colors=["cyan"], linewidths=[1.0], alpha=0.5)
+
+    for ax in [axes[0], axes[2], axes[3]]:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    plt.tight_layout()
+    plt.show()

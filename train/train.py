@@ -57,6 +57,12 @@ def train(args):
 
         for eps, fields in train_loader:
             eps, fields = eps.to(device), fields.to(device)
+
+            # Per-sample 50% vertical y-flip augmentation
+            flip_mask = torch.rand(eps.size(0), 1, 1, 1, device=device) < 0.5
+            eps = torch.where(flip_mask, torch.flip(eps, dims=[-1]), eps)
+            fields = torch.where(flip_mask, torch.flip(fields, dims=[-1]), fields)
+
             optimizer.zero_grad(set_to_none=True)
             pred = model(eps)
             loss = field_loss(pred, fields, args.grad_loss_weight)

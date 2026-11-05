@@ -80,9 +80,6 @@ class FNO2d(nn.Module):
         self.pointwise_layers = nn.ModuleList([
             nn.Conv2d(width, width, kernel_size=1) for _ in range(n_layers)
         ])
-        self.norms = nn.ModuleList([
-            nn.InstanceNorm2d(width, affine=True) for _ in range(n_layers)
-        ])
 
         self.proj = nn.Sequential(
             nn.Conv2d(width, width * 2, kernel_size=1),
@@ -93,8 +90,8 @@ class FNO2d(nn.Module):
     def forward(self, x):
         x = append_coords(x)
         x = self.lift(x)
-        for spec, pw, norm in zip(self.spectral_layers, self.pointwise_layers, self.norms):
-            x = F.gelu(norm(spec(x) + pw(x)))
+        for spec, pw in zip(self.spectral_layers, self.pointwise_layers):
+            x = F.gelu(spec(x) + pw(x))
         return self.proj(x)
 
 
