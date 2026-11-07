@@ -1,37 +1,26 @@
-import os
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
+from data.arguments import get_args
 from data.solver import HelmholtzSolver2D
-from model.model import build_model
 from design.losses import SplitterLoss
+from design.adjoint import solve_fdfd_differentiable
 
 
 class PhotonicFitter:
     """
-    End-to-end inverse design fitter using a frozen neural surrogate (FNO/U-Net).
+    End-to-end photonic inverse design fitter using Exact FDFD Adjoint Optimization.
     """
-    def __init__(self, ckpt_path="checkpoints/best_fno.pt", device="auto"):
+    def __init__(self, device="auto", smooth_sigma=2.5):
         self.device = self._resolve_device(device)
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"Checkpoint not found at '{ckpt_path}'")
+        self.config = vars(get_args([]))
 
-        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        self.config = ckpt["config"]
-        self.field_std = ckpt["field_std"]
-
-        # Initialize ground-truth FDFD solver for template & final verification
+        # Initialize ground-truth 2D Helmholtz FDFD solver
         self.solver = HelmholtzSolver2D.from_args(self.config)
-
-        # Load and freeze neural surrogate
-        self.model = build_model(self.config).to(self.device)
-        self.model.load_state_dict(ckpt["model_state"])
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad_(False)
+        self.field_std = 1.0
 
         # Precompute normalized waveguide base template on device
         eps_empty = self.solver.make_eps(np.zeros(self.solver.design_shape, dtype=np.float32))
@@ -42,6 +31,15 @@ class PhotonicFitter:
         self.x0, self.x1 = self.solver.x_in_end, self.solver.x_out_start
         yc = self.solver.ny // 2
         self.y0, self.y1 = yc - self.solver.design_half_y, yc + self.solver.design_half_y
+
+        # Precompute circular Gaussian smoothing kernel for manufacturable feature sizes
+        k_rad = int(np.ceil(2.5 * smooth_sigma))
+        coords = torch.arange(-k_rad, k_rad + 1, device=self.device, dtype=torch.float32)
+        kx, ky = torch.meshgrid(coords, coords, indexing="ij")
+        kernel = torch.exp(-0.5 * (kx ** 2 + ky ** 2) / (smooth_sigma ** 2))
+        kernel = kernel / kernel.sum()
+        self.smooth_kernel = kernel.unsqueeze(0).unsqueeze(0)
+        self.k_pad = k_rad
 
         self.criterion = SplitterLoss(self.solver, self.field_std, self.device)
 
@@ -55,14 +53,17 @@ class PhotonicFitter:
             return torch.device("mps")
         return torch.device("cpu")
 
+    def evaluate(self, rho_np):
+        Ez = self.solver.solve(self.solver.make_eps(rho_np))
+        t1, t2 = self.solver.measure_port_powers(Ez)
+        return Ez, t1, t2
+
     def _project_density(self, z, beta, symmetric=False):
         if symmetric:
             z = 0.5 * (z + torch.flip(z, dims=[-1]))
-        # Two passes of 3x3 average pooling = 5x5 triangular tent filter
-        z_smooth = z.unsqueeze(0).unsqueeze(0)
-        z_smooth = F.avg_pool2d(z_smooth, kernel_size=3, stride=1, padding=1, count_include_pad=False)
-        z_smooth = F.avg_pool2d(z_smooth, kernel_size=3, stride=1, padding=1, count_include_pad=False)
-        return torch.sigmoid(beta * z_smooth.squeeze())
+        z_4d = F.pad(z.unsqueeze(0).unsqueeze(0), (self.k_pad,) * 4, mode="replicate")
+        z_smooth = F.conv2d(z_4d, self.smooth_kernel).squeeze()
+        return torch.sigmoid(beta * z_smooth)
 
     def _assemble_eps_norm(self, rho):
         """Inserts the (40, 48) differentiable rho patch into the (1, 1, 128, 128) chip grid."""
@@ -71,17 +72,6 @@ class PhotonicFitter:
         return eps
 
     def _init_latent(self, init_mode="y_branch", fill_val=0.5):
-        """
-        Initializes the unconstrained latent tensor z for the (nx_d, ny_d) design region.
-        Supported init_mode:
-          - "y_branch" : Smooth Gaussian Y-junction skeleton
-          - "taper"    : Wide linear horn/funnel connecting input to both outputs
-          - "mmi"      : Rectangular central slab of silicon (Multi-Mode Interference block)
-          - "empty"    : Low-density oxide background (rho ≈ 0.10)
-          - "filled"   : High-density silicon block (rho ≈ 0.90)
-          - "gray"     : Uniform 50% gray mist (rho = fill_val, default 0.50)
-          - "random"   : Smooth random Gaussian noise around 0.50
-        """
         nx_d, ny_d = self.solver.design_shape
         x = torch.linspace(0, 1, nx_d, device=self.device)[:, None]
         y = torch.arange(ny_d, device=self.device, dtype=torch.float32)[None, :] - ((ny_d - 1) / 2.0)
@@ -91,55 +81,33 @@ class PhotonicFitter:
             w = float(self.solver.wg_half)
             skel = torch.exp(-0.5 * ((y - offset) / w) ** 2) + torch.exp(-0.5 * ((y + offset) / w) ** 2)
             rho0 = torch.clamp(skel, 0.05, 0.95)
-
         elif init_mode == "taper":
-            # Smoothly widens from input waveguide half-width to outer edge of output ports
             half_width = float(self.solver.wg_half) + x * float(self.solver.port_offset + self.solver.wg_half)
             rho0 = torch.sigmoid((half_width - torch.abs(y)) / 2.0)
             rho0 = torch.clamp(rho0, 0.05, 0.95)
-
-        elif init_mode == "mmi":
-            # Rectangular silicon slab covering the port span across all (nx_d, ny_d) pixels
-            slab_half_y = float(self.solver.port_offset + self.solver.wg_half)
-            rho0 = torch.sigmoid((slab_half_y - torch.abs(y)) / 1.5).expand(nx_d, ny_d)
-            rho0 = torch.clamp(rho0, 0.05, 0.95)
-
         elif init_mode == "empty":
             rho0 = torch.full((nx_d, ny_d), 0.10, device=self.device)
-
         elif init_mode == "filled":
             rho0 = torch.full((nx_d, ny_d), 0.90, device=self.device)
-
-        elif init_mode == "random":
-            rho0 = torch.clamp(0.5 + 0.15 * torch.randn((nx_d, ny_d), device=self.device), 0.05, 0.95)
-
-        else:  # "gray" or custom fill_val
+        else:
             val = float(np.clip(fill_val, 0.05, 0.95))
             rho0 = torch.full((nx_d, ny_d), val, device=self.device)
 
         return torch.logit(rho0)
 
-    def _predict_equivariant(self, eps_in):
-        # f_sym(x) = 0.5 * (f(x) + flip(f(flip(x))))
-        pred1 = self.model(eps_in)
-        pred2 = torch.flip(self.model(torch.flip(eps_in, dims=[-1])), dims=[-1])
-        return 0.5 * (pred1 + pred2)
-
     def fit(
         self,
         target_ratio=0.5,
-        total_target=0.92,
-        steps=150,
-        lr=0.08,
+        total_target=0.98,
+        steps=200,
+        lr=0.05,
         init_mode="y_branch",
         symmetric=None,
         beta_start=1.5,
-        beta_end=6.0,
-        verify_fdfd=True,
+        beta_end=12.0,
     ):
         """
-        Optimizes the 40x48 design region to achieve `target_ratio` power splitting.
-        If symmetric is None, automatically enforces symmetry when target_ratio == 0.5.
+        Optimizes the 40x48 design region using exact FDFD adjoint gradients.
         """
         if symmetric is None:
             symmetric = abs(target_ratio - 0.5) < 1e-3
@@ -148,12 +116,14 @@ class PhotonicFitter:
         optimizer = torch.optim.Adam([z], lr=lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=lr * 0.05)
 
-        history = {"loss": [], "t1_surr": [], "t2_surr": [], "total_surr": []}
-        pbar = tqdm(range(1, steps + 1), desc=f"Fitting Splitter ({target_ratio*100:.0f}/{(1-target_ratio)*100:.0f})")
+        history = {"loss": [], "t1": [], "t2": [], "total": [], "t1_surr": [], "t2_surr": [], "total_surr": []}
+        pbar = tqdm(
+            range(1, steps + 1),
+            desc=f"Fitting [FDFD Adjoint] ({target_ratio*100:.0f}/{(1-target_ratio)*100:.0f})",
+        )
 
+        t0 = time.perf_counter()
         for step in pbar:
-
-            # Reach full binarization at 75% of total steps, then let the optimizer fine-tune at fixed beta
             frac = min((step - 1) / max(0.75 * steps, 1), 1.0)
             beta = beta_start + (beta_end - beta_start) * (frac ** 1.5)
             bin_weight = 0.01 + 0.08 * (frac ** 2)
@@ -162,7 +132,7 @@ class PhotonicFitter:
             rho = self._project_density(z, beta=beta, symmetric=symmetric)
             eps_in = self._assemble_eps_norm(rho)
 
-            pred_field = self._predict_equivariant(eps_in)
+            pred_field = solve_fdfd_differentiable(eps_in, self.solver, self.field_std)
             loss, t1, t2 = self.criterion(
                 pred_field,
                 rho,
@@ -176,6 +146,10 @@ class PhotonicFitter:
 
             t1_v, t2_v = t1.item(), t2.item()
             history["loss"].append(loss.item())
+            history["t1"].append(t1_v)
+            history["t2"].append(t2_v)
+            history["total"].append(t1_v + t2_v)
+            # Keep *_surr aliases so existing plotting.py works without any edits
             history["t1_surr"].append(t1_v)
             history["t2_surr"].append(t2_v)
             history["total_surr"].append(t1_v + t2_v)
@@ -187,38 +161,25 @@ class PhotonicFitter:
                 beta=f"{beta:.1f}",
             )
 
-        # Finalize design & run ground-truth FDFD check
-        with torch.no_grad():
-            rho_final = self._project_density(z, beta=beta_end, symmetric=symmetric)
-            eps_final_in = self._assemble_eps_norm(rho_final)
-            pred_final = self._predict_equivariant(eps_final_in).squeeze(0).cpu().numpy()
-            Ez_surr = (pred_final[0] + 1j * pred_final[1]) * self.field_std
-            rho_np = rho_final.cpu().numpy()
+        elapsed = time.perf_counter() - t0
 
-        result = {
-            "rho": rho_np,
-            "eps_norm": eps_final_in.squeeze().cpu().numpy(),
-            "Ez_surr": Ez_surr,
-            "t1_surr": history["t1_surr"][-1],
-            "t2_surr": history["t2_surr"][-1],
+        with torch.no_grad():
+            rho_gray = self._project_density(z, beta=beta_end, symmetric=symmetric)
+            rho_gray_np = rho_gray.cpu().numpy()
+            rho_bin_np = (rho_gray_np > 0.5).astype(np.float32)
+
+        Ez_bin, t1_b, t2_b = self.evaluate(rho_bin_np)
+        print(f" [FDFD Adjoint Fit in {elapsed:.1f}s]\n")
+
+        return {
+            # headline = binary design (what you would fabricate)
+            "rho": rho_bin_np,
+            "eps_norm": self._assemble_eps_norm(torch.from_numpy(rho_bin_np).to(self.device)).squeeze().cpu().numpy(),
+            "Ez_fit": Ez_bin,   
+            "t1_fit": t1_b,
+            "t2_fit": t2_b,
+
             "history": history,
             "target_ratio": target_ratio,
+            "elapsed_sec": elapsed,
         }
-
-        if verify_fdfd:
-            eps_phys = self.solver.make_eps(rho_np)
-            Ez_true = self.solver.solve(eps_phys)
-            t1_true, t2_true = self.solver.measure_port_powers(Ez_true)
-            result.update({
-                "Ez_true": Ez_true,
-                "t1_true": t1_true,
-                "t2_true": t2_true,
-            })
-            print(
-                f" Surrogate Prediction : Port 1 = {result['t1_surr']*100:.1f}%, Port 2 = {result['t2_surr']*100:.1f}% "
-                f"(Total = {(result['t1_surr']+result['t2_surr'])*100:.1f}%)\n"
-                f" FDFD Ground Truth    : Port 1 = {t1_true*100:.1f}%, Port 2 = {t2_true*100:.1f}% "
-                f"(Total = {(t1_true+t2_true)*100:.1f}%)"
-            )
-
-        return result
