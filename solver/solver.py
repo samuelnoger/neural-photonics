@@ -4,7 +4,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from matplotlib import pyplot as plt
 
-from data.arguments import get_args
+from solver.arguments import get_args
 
 
 class HelmholtzSolver2D:
