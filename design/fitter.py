@@ -4,8 +4,8 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from data.arguments import get_args
-from data.solver import HelmholtzSolver2D
+from solver.arguments import get_args
+from solver.solver import HelmholtzSolver2D
 from design.losses import SplitterLoss
 from design.adjoint import solve_fdfd_differentiable
 
@@ -14,7 +14,7 @@ class PhotonicFitter:
     """
     End-to-end photonic inverse design fitter using Exact FDFD Adjoint Optimization.
     """
-    def __init__(self, device="auto", smooth_sigma=2.5):
+    def __init__(self, device="auto", smooth_sigma=3.0):
         self.device = self._resolve_device(device)
         self.config = vars(get_args([]))
 
@@ -41,6 +41,23 @@ class PhotonicFitter:
         self.smooth_kernel = kernel.unsqueeze(0).unsqueeze(0)
         self.k_pad = k_rad
 
+        nx_d, ny_d = self.solver.design_shape
+        c  = self.solver.design_half_y            # local axis index
+        wg = self.solver.wg_half
+        po = self.solver.port_offset
+        yy = torch.arange(ny_d, device=self.device)
+        band = lambda lo, hi: ((yy >= lo) & (yy < hi)).float()
+
+        left  = band(c - wg, c + wg)                                              # input waveguide
+        right = band(c - po - wg, c - po + wg) + band(c + po - wg, c + po + wg)   # two output waveguides
+
+        n_pin = self.k_pad + 2                    # >= filter radius, so the outer pinned columns stay clean
+        self.pin = torch.zeros(nx_d, ny_d, device=self.device)
+        pin_z    = torch.zeros(nx_d, ny_d, device=self.device)
+        self.pin[:n_pin, :]  = 1;  pin_z[:n_pin, :]  = (2 * left  - 1) * 2.0      # +2 inside silicon, -2 outside
+        self.pin[-n_pin:, :] = 1;  pin_z[-n_pin:, :] = (2 * right - 1) * 2.0
+        self.pin_z = pin_z
+
         self.criterion = SplitterLoss(self.solver, self.field_std, self.device)
 
     @staticmethod
@@ -58,12 +75,13 @@ class PhotonicFitter:
         t1, t2 = self.solver.measure_port_powers(Ez)
         return Ez, t1, t2
 
-    def _project_density(self, z, beta, symmetric=False):
+    def _project_density(self, z, beta, symmetric=False, shift=0.0):
         if symmetric:
             z = 0.5 * (z + torch.flip(z, dims=[-1]))
+        z = self.pin * self.pin_z + (1 - self.pin) * z          # pinned columns are fixed
         z_4d = F.pad(z.unsqueeze(0).unsqueeze(0), (self.k_pad,) * 4, mode="replicate")
         z_smooth = F.conv2d(z_4d, self.smooth_kernel).squeeze()
-        return torch.sigmoid(beta * z_smooth)
+        return torch.sigmoid(beta * (z_smooth + shift * (1 - self.pin))) 
 
     def _assemble_eps_norm(self, rho):
         """Inserts the (40, 48) differentiable rho patch into the (1, 1, 128, 128) chip grid."""
@@ -105,6 +123,8 @@ class PhotonicFitter:
         symmetric=None,
         beta_start=1.5,
         beta_end=12.0,
+        robust_delta=0.0,     # latent-space threshold shift; 0 disables robust optimization
+        robust_start=0.5,
     ):
         """
         Optimizes the 40x48 design region using exact FDFD adjoint gradients.
@@ -129,17 +149,20 @@ class PhotonicFitter:
             bin_weight = 0.01 + 0.08 * (frac ** 2)
 
             optimizer.zero_grad()
-            rho = self._project_density(z, beta=beta, symmetric=symmetric)
-            eps_in = self._assemble_eps_norm(rho)
 
-            pred_field = solve_fdfd_differentiable(eps_in, self.solver, self.field_std)
-            loss, t1, t2 = self.criterion(
-                pred_field,
-                rho,
-                target_ratio=target_ratio,
-                total_target=total_target,
-                bin_weight=bin_weight,
-            )
+            use_robust = robust_delta > 0 and step > robust_start * steps
+            shifts = (0.0, robust_delta, -robust_delta) if use_robust else (0.0,)
+
+            loss = 0.0
+            for shift in shifts:
+                rho_s = self._project_density(z, beta=beta, symmetric=symmetric, shift=shift)
+                field = solve_fdfd_differentiable(self._assemble_eps_norm(rho_s), self.solver, self.field_std)
+                l, t1_s, t2_s = self.criterion(field, rho_s, target_ratio=target_ratio,
+                                               total_target=total_target, bin_weight=bin_weight)
+                loss = loss + l / len(shifts)
+                if shift == 0.0:
+                    t1, t2 = t1_s, t2_s
+
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -178,6 +201,8 @@ class PhotonicFitter:
             "Ez_fit": Ez_bin,   
             "t1_fit": t1_b,
             "t2_fit": t2_b,
+
+            "z": z.detach().cpu(),
 
             "history": history,
             "target_ratio": target_ratio,
