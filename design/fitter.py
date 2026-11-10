@@ -6,59 +6,51 @@ from tqdm.auto import tqdm
 
 from solver.arguments import get_args
 from solver.solver import HelmholtzSolver2D
+from design.geometry import build_geometry
 from design.losses import SplitterLoss
 from design.adjoint import solve_fdfd_differentiable
 
 
 class PhotonicFitter:
     """
-    End-to-end photonic inverse design fitter using Exact FDFD Adjoint Optimization.
+    Universal photonic inverse design fitter supporting:
+      - 1x2 Splitters (device_type="splitter_1x2")
+      - 1x3 Splitters (device_type="splitter_1x3")
+      - 2-Wavelength WDM Demultiplexers (device_type="wdm_1x2")
     """
-    def __init__(self, device="auto", smooth_sigma=3.0):
+    def __init__(self, device_type="splitter_1x2", device="auto", smooth_sigma=3.0, **overrides):
         self.device = self._resolve_device(device)
-        self.config = vars(get_args([]))
+        self.config = vars(get_args(device_type=device_type, custom_args=[]))
+        self.config.update(overrides)
+        self.device_type = self.config["device_type"]
 
-        # Initialize ground-truth 2D Helmholtz FDFD solver
-        self.solver = HelmholtzSolver2D.from_args(self.config)
+        # Build geometry and per-wavelength FDFD solvers + loss criteria
+        self.geometry = build_geometry(self.config)
         self.field_std = 1.0
+        self.wls = self.geometry.wls if self.device_type == "wdm_1x2" else [self.config["wl"]]
+
+        self.solvers = [HelmholtzSolver2D.from_args(self.config, geometry=self.geometry, wl_override=w) for w in self.wls]
+        self.solver = self.solvers[0]  # Primary solver reference
+        self.criteria = [SplitterLoss(s, self.field_std, self.device) for s in self.solvers]
 
         # Precompute normalized waveguide base template on device
-        eps_empty = self.solver.make_eps(np.zeros(self.solver.design_shape, dtype=np.float32))
-        eps_norm_empty = (eps_empty - self.solver.eps_bg) / (self.solver.eps_si - self.solver.eps_bg)
+        eps_empty = self.geometry.make_eps(np.zeros(self.geometry.design_shape, dtype=np.float32))
+        eps_norm_empty = (eps_empty - self.geometry.eps_bg) / (self.geometry.eps_si - self.geometry.eps_bg)
         self.base_eps_norm = torch.from_numpy(eps_norm_empty).float().to(self.device).unsqueeze(0).unsqueeze(0)
 
-        # Design region slice coordinates
-        self.x0, self.x1 = self.solver.x_in_end, self.solver.x_out_start
-        yc = self.solver.ny // 2
-        self.y0, self.y1 = yc - self.solver.design_half_y, yc + self.solver.design_half_y
+        self.x0, self.x1 = self.geometry.x0, self.geometry.x1
+        self.y0, self.y1 = self.geometry.y0, self.geometry.y1
 
-        # Precompute circular Gaussian smoothing kernel for manufacturable feature sizes
+        # Precompute circular Gaussian smoothing kernel
         k_rad = int(np.ceil(2.5 * smooth_sigma))
         coords = torch.arange(-k_rad, k_rad + 1, device=self.device, dtype=torch.float32)
         kx, ky = torch.meshgrid(coords, coords, indexing="ij")
         kernel = torch.exp(-0.5 * (kx ** 2 + ky ** 2) / (smooth_sigma ** 2))
-        kernel = kernel / kernel.sum()
-        self.smooth_kernel = kernel.unsqueeze(0).unsqueeze(0)
+        self.smooth_kernel = (kernel / kernel.sum()).unsqueeze(0).unsqueeze(0)
         self.k_pad = k_rad
 
-        nx_d, ny_d = self.solver.design_shape
-        c  = self.solver.design_half_y            # local axis index
-        wg = self.solver.wg_half
-        po = self.solver.port_offset
-        yy = torch.arange(ny_d, device=self.device)
-        band = lambda lo, hi: ((yy >= lo) & (yy < hi)).float()
-
-        left  = band(c - wg, c + wg)                                              # input waveguide
-        right = band(c - po - wg, c - po + wg) + band(c + po - wg, c + po + wg)   # two output waveguides
-
-        n_pin = self.k_pad + 2                    # >= filter radius, so the outer pinned columns stay clean
-        self.pin = torch.zeros(nx_d, ny_d, device=self.device)
-        pin_z    = torch.zeros(nx_d, ny_d, device=self.device)
-        self.pin[:n_pin, :]  = 1;  pin_z[:n_pin, :]  = (2 * left  - 1) * 2.0      # +2 inside silicon, -2 outside
-        self.pin[-n_pin:, :] = 1;  pin_z[-n_pin:, :] = (2 * right - 1) * 2.0
-        self.pin_z = pin_z
-
-        self.criterion = SplitterLoss(self.solver, self.field_std, self.device)
+        # Universal port pinning from geometry
+        self.pin, self.pin_z = self.geometry.get_pin_masks(n_pin=self.k_pad + 2, device=self.device)
 
     @staticmethod
     def _resolve_device(device_arg):
@@ -70,77 +62,67 @@ class PhotonicFitter:
             return torch.device("mps")
         return torch.device("cpu")
 
-    def evaluate(self, rho_np):
-        Ez = self.solver.solve(self.solver.make_eps(rho_np))
-        t1, t2 = self.solver.measure_port_powers(Ez)
-        return Ez, t1, t2
+    def evaluate(self, rho_np, solver=None):
+        s = solver if solver is not None else self.solver
+        Ez = s.solve(s.make_eps(rho_np))
+        powers = s.measure_port_powers(Ez)
+        return Ez, powers
 
     def _project_density(self, z, beta, symmetric=False, shift=0.0):
         if symmetric:
             z = 0.5 * (z + torch.flip(z, dims=[-1]))
-        z = self.pin * self.pin_z + (1 - self.pin) * z          # pinned columns are fixed
+        z = self.pin * self.pin_z + (1.0 - self.pin) * z
         z_4d = F.pad(z.unsqueeze(0).unsqueeze(0), (self.k_pad,) * 4, mode="replicate")
         z_smooth = F.conv2d(z_4d, self.smooth_kernel).squeeze()
-        return torch.sigmoid(beta * (z_smooth + shift * (1 - self.pin))) 
+        return torch.sigmoid(beta * (z_smooth + shift * (1.0 - self.pin)))
 
     def _assemble_eps_norm(self, rho):
-        """Inserts the (40, 48) differentiable rho patch into the (1, 1, 128, 128) chip grid."""
         eps = self.base_eps_norm.clone()
         eps[0, 0, self.x0 : self.x1, self.y0 : self.y1] = rho
         return eps
 
-    def _init_latent(self, init_mode="y_branch", fill_val=0.5):
-        nx_d, ny_d = self.solver.design_shape
-        x = torch.linspace(0, 1, nx_d, device=self.device)[:, None]
-        y = torch.arange(ny_d, device=self.device, dtype=torch.float32)[None, :] - ((ny_d - 1) / 2.0)
-
-        if init_mode == "y_branch":
-            offset = float(self.solver.port_offset) * x
-            w = float(self.solver.wg_half)
-            skel = torch.exp(-0.5 * ((y - offset) / w) ** 2) + torch.exp(-0.5 * ((y + offset) / w) ** 2)
-            rho0 = torch.clamp(skel, 0.05, 0.95)
-        elif init_mode == "taper":
-            half_width = float(self.solver.wg_half) + x * float(self.solver.port_offset + self.solver.wg_half)
-            rho0 = torch.sigmoid((half_width - torch.abs(y)) / 2.0)
-            rho0 = torch.clamp(rho0, 0.05, 0.95)
-        elif init_mode == "empty":
-            rho0 = torch.full((nx_d, ny_d), 0.10, device=self.device)
-        elif init_mode == "filled":
-            rho0 = torch.full((nx_d, ny_d), 0.90, device=self.device)
-        else:
-            val = float(np.clip(fill_val, 0.05, 0.95))
-            rho0 = torch.full((nx_d, ny_d), val, device=self.device)
-
-        return torch.logit(rho0)
+    def _resolve_targets(self, target_ratio, target_ratios):
+        """Resolves per-wavelength target ratio vectors for 1x2, 1x3, or WDM."""
+        if self.device_type == "wdm_1x2":
+            # Wavelength 0 -> Port 1 ([1, 0]), Wavelength 1 -> Port 2 ([0, 1])
+            return [[1.0, 0.0], [0.0, 1.0]]
+        if target_ratios is not None:
+            r = np.asarray(target_ratios, dtype=np.float32)
+            return [(r / r.sum()).tolist()]
+        if self.geometry.n_ports == 2:
+            tr = 0.5 if target_ratio is None else float(target_ratio)
+            return [[tr, 1.0 - tr]]
+        # Default equal split for 1xN (e.g. [1/3, 1/3, 1/3] for 1x3)
+        n = self.geometry.n_ports
+        return [[1.0 / n] * n]
 
     def fit(
         self,
-        target_ratio=0.5,
-        total_target=0.98,
+        target_ratio=None,
+        target_ratios=None,
+        total_target=0.96,
         steps=200,
         lr=0.05,
-        init_mode="y_branch",
+        init_mode="branched",
         symmetric=None,
         beta_start=1.5,
         beta_end=12.0,
-        robust_delta=0.0,     # latent-space threshold shift; 0 disables robust optimization
+        robust_delta=0.0,
         robust_start=0.5,
     ):
-        """
-        Optimizes the 40x48 design region using exact FDFD adjoint gradients.
-        """
+        wl_targets = self._resolve_targets(target_ratio, target_ratios)
         if symmetric is None:
-            symmetric = abs(target_ratio - 0.5) < 1e-3
+            # Enforce y-symmetry automatically if targets are symmetric and not WDM
+            t0 = wl_targets[0]
+            symmetric = (self.device_type != "wdm_1x2") and np.allclose(t0, t0[::-1], atol=1e-3)
 
-        z = self._init_latent(init_mode).requires_grad_(True)
+        z = self.geometry.init_latent(init_mode=init_mode, device=self.device).requires_grad_(True)
+        
         optimizer = torch.optim.Adam([z], lr=lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=lr * 0.05)
 
-        history = {"loss": [], "t1": [], "t2": [], "total": [], "t1_surr": [], "t2_surr": [], "total_surr": []}
-        pbar = tqdm(
-            range(1, steps + 1),
-            desc=f"Fitting [FDFD Adjoint] ({target_ratio*100:.0f}/{(1-target_ratio)*100:.0f})",
-        )
+        history = {"loss": [], "powers": [], "total": [], "t1": [], "t2": [], "t1_surr": [], "t2_surr": [], "total_surr": []}
+        pbar = tqdm(range(1, steps + 1), desc=f"Fitting [{self.device_type}]")
 
         t0 = time.perf_counter()
         for step in pbar:
@@ -149,62 +131,70 @@ class PhotonicFitter:
             bin_weight = 0.01 + 0.08 * (frac ** 2)
 
             optimizer.zero_grad()
-
             use_robust = robust_delta > 0 and step > robust_start * steps
             shifts = (0.0, robust_delta, -robust_delta) if use_robust else (0.0,)
 
             loss = 0.0
+            nom_powers = []
             for shift in shifts:
                 rho_s = self._project_density(z, beta=beta, symmetric=symmetric, shift=shift)
-                field = solve_fdfd_differentiable(self._assemble_eps_norm(rho_s), self.solver, self.field_std)
-                l, t1_s, t2_s = self.criterion(field, rho_s, target_ratio=target_ratio,
-                                               total_target=total_target, bin_weight=bin_weight)
-                loss = loss + l / len(shifts)
-                if shift == 0.0:
-                    t1, t2 = t1_s, t2_s
+                eps_in = self._assemble_eps_norm(rho_s)
+                for s_idx, (solver, criterion) in enumerate(zip(self.solvers, self.criteria)):
+                    field = solve_fdfd_differentiable(eps_in, solver, self.field_std)
+                    l, p_vec = criterion(
+                        field, rho_s, target_ratios=wl_targets[s_idx],
+                        total_target=total_target, bin_weight=bin_weight
+                    )
+                    loss = loss + l / (len(shifts) * len(self.solvers))
+                    if shift == 0.0:
+                        nom_powers.append(p_vec.detach().cpu().numpy())
 
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            t1_v, t2_v = t1.item(), t2.item()
+            p0 = nom_powers[0]  # Primary wavelength port powers
+            tot_v = float(np.sum(p0))
             history["loss"].append(loss.item())
-            history["t1"].append(t1_v)
-            history["t2"].append(t2_v)
-            history["total"].append(t1_v + t2_v)
-            # Keep *_surr aliases so existing plotting.py works without any edits
-            history["t1_surr"].append(t1_v)
-            history["t2_surr"].append(t2_v)
-            history["total_surr"].append(t1_v + t2_v)
+            history["powers"].append(p0.tolist())
+            history["total"].append(tot_v)
+            history["t1"].append(float(p0[0]))
+            history["t2"].append(float(p0[1]))
+            history["t1_surr"].append(float(p0[0]))
+            history["t2_surr"].append(float(p0[1]))
+            history["total_surr"].append(tot_v)
 
-            pbar.set_postfix(
-                T1=f"{t1_v*100:.1f}%",
-                T2=f"{t2_v*100:.1f}%",
-                Tot=f"{(t1_v+t2_v)*100:.1f}%",
-                beta=f"{beta:.1f}",
-            )
+            ports_str = "/".join(f"{p*100:.1f}%" for p in p0)
+            pbar.set_postfix(Ports=ports_str, Tot=f"{tot_v*100:.1f}%", beta=f"{beta:.1f}")
 
         elapsed = time.perf_counter() - t0
 
         with torch.no_grad():
             rho_gray = self._project_density(z, beta=beta_end, symmetric=symmetric)
-            rho_gray_np = rho_gray.cpu().numpy()
-            rho_bin_np = (rho_gray_np > 0.5).astype(np.float32)
+            rho_bin_np = (rho_gray.cpu().numpy() > 0.5).astype(np.float32)
 
-        Ez_bin, t1_b, t2_b = self.evaluate(rho_bin_np)
-        print(f" [FDFD Adjoint Fit in {elapsed:.1f}s]\n")
+        Ez_list, powers_list = [], []
+        for s in self.solvers:
+            Ez_b, p_b = self.evaluate(rho_bin_np, solver=s)
+            Ez_list.append(Ez_b)
+            powers_list.append(p_b)
+
+        p_main = powers_list[0]
+        print(f" [{self.device_type} Fit in {elapsed:.1f}s] Ports: {[round(x*100, 1) for x in p_main]}%")
 
         return {
-            # headline = binary design (what you would fabricate)
+            "device_type": self.device_type,
             "rho": rho_bin_np,
             "eps_norm": self._assemble_eps_norm(torch.from_numpy(rho_bin_np).to(self.device)).squeeze().cpu().numpy(),
-            "Ez_fit": Ez_bin,   
-            "t1_fit": t1_b,
-            "t2_fit": t2_b,
-
+            "Ez_fit": Ez_list[0],
+            "Ez_all": Ez_list,
+            "powers_fit": p_main,
+            "powers_all": powers_list,
+            "t1_fit": p_main[0],
+            "t2_fit": p_main[1],
             "z": z.detach().cpu(),
-
             "history": history,
-            "target_ratio": target_ratio,
+            "target_ratios": wl_targets[0],
+            "target_ratio": wl_targets[0][0],
             "elapsed_sec": elapsed,
         }

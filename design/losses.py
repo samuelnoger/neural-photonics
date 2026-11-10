@@ -8,44 +8,32 @@ class SplitterLoss(torch.nn.Module):
         self.x_meas = solver.x_meas
         self.field_std = float(field_std)
         self.p_ref = float(solver.ref_power)
-
-        # Directly reuse the normalized mode profiles from HelmholtzSolver2D
-        self.m1 = torch.from_numpy(solver.mode_p1).float().to(device)
-        self.m2 = torch.from_numpy(solver.mode_p2).float().to(device)
+        self.modes = [torch.from_numpy(m).float().to(device) for m in solver.geometry.mode_ports]
 
     def measure_ports_torch(self, pred_field):
-        """
-        Differentiable equivalent of solver.measure_port_powers(Ez).
-        pred_field: (1, 2, nx, ny) standardized real/imag field from surrogate.
-        Returns (T1, T2) as differentiable scalar tensors.
-        """
-        # Un-standardize back to physical Ez units at the measurement slice x_meas
         ez_re = pred_field[0, 0, self.x_meas, :] * self.field_std
         ez_im = pred_field[0, 1, self.x_meas, :] * self.field_std
+        powers = []
+        for m in self.modes:
+            c_re = torch.dot(ez_re, m)
+            c_im = torch.dot(ez_im, m)
+            powers.append((c_re ** 2 + c_im ** 2) / self.p_ref)
+        return torch.stack(powers)  # shape: (n_ports,)
 
-        # Complex overlap integral |(Ez, m_k)|^2 = (Re(Ez).m_k)^2 + (Im(Ez).m_k)^2
-        c1_re = torch.dot(ez_re, self.m1)
-        c1_im = torch.dot(ez_im, self.m1)
-        p1 = (c1_re ** 2 + c1_im ** 2) / self.p_ref
+    def forward(self, pred_field, rho, target_ratios, total_target=0.96, bin_weight=0.05, tv_weight=0.015):
+        powers = self.measure_ports_torch(pred_field)
+        targets = torch.as_tensor(target_ratios, dtype=powers.dtype, device=powers.device)
+        targets = targets / targets.sum()
 
-        c2_re = torch.dot(ez_re, self.m2)
-        c2_im = torch.dot(ez_im, self.m2)
-        p2 = (c2_re ** 2 + c2_im ** 2) / self.p_ref
-
-        return p1, p2
-
-    def forward(self, pred_field, rho, target_ratio=0.5, total_target=0.85, bin_weight=0.05):
-        t1, t2 = self.measure_ports_torch(pred_field)
-
-        t1_goal = total_target * target_ratio
-        t2_goal = total_target * (1.0 - target_ratio)
-
-        # 1. Port transmission matching loss + maximize total throughput
-        ratio_loss = (t1 - t1_goal) ** 2 + (t2 - t2_goal) ** 2
-        throughput_loss = F.relu(total_target - (t1 + t2)) ** 2
-
-        # 2. Binarization penalty: 4 * rho * (1 - rho) is 1 at rho=0.5 and 0 at rho={0, 1}
+        goals = total_target * targets
+        ratio_loss = ((powers - goals) ** 2).sum()
+        throughput_loss = F.relu(total_target - powers.sum()) ** 2
         bin_loss = (4.0 * rho * (1.0 - rho)).mean()
 
-        loss = ratio_loss + 0.5 * throughput_loss + bin_weight * bin_loss
-        return loss, t1, t2
+        # Total Variation (perimeter) penalty + tiny L1 void-clearing penalty
+        tv_x = torch.abs(rho[1:, :] - rho[:-1, :]).mean()
+        tv_y = torch.abs(rho[:, 1:] - rho[:, :-1]).mean()
+        reg_loss = tv_weight * (tv_x + tv_y) + 0.005 * rho.mean()
+
+        loss = ratio_loss + 0.5 * throughput_loss + bin_weight * bin_loss + reg_loss
+        return loss, powers
