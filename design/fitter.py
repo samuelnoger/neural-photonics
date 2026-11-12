@@ -1,5 +1,6 @@
 import time
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
@@ -7,7 +8,7 @@ from tqdm.auto import tqdm
 from solver.arguments import get_args
 from solver.solver import HelmholtzSolver2D
 from design.geometry import build_geometry
-from design.losses import SplitterLoss
+from design.losses import splitter_loss, wdm_loss
 from design.adjoint import solve_fdfd_differentiable
 
 
@@ -18,30 +19,24 @@ class PhotonicFitter:
       - 1x3 Splitters (device_type="splitter_1x3")
       - 2-Wavelength WDM Demultiplexers (device_type="wdm_1x2")
     """
-    def __init__(self, device_type="splitter_1x2", device="auto", smooth_sigma=3.0, **overrides):
-        self.device = self._resolve_device(device)
+    def __init__(self, device_type="splitter_1x2", device="cpu", smooth_sigma=4.0, **overrides):
+        self.device = torch.device("cpu") if device in ("auto", "cpu") else torch.device(device)
         self.config = vars(get_args(device_type=device_type, custom_args=[]))
         self.config.update(overrides)
         self.device_type = self.config["device_type"]
 
-        # Build geometry and per-wavelength FDFD solvers + loss criteria
-        self.geometry = build_geometry(self.config)
-        self.field_std = 1.0
+        # Build geometry (with tensors on self.device) and per-wavelength FDFD solvers
+        self.geometry = build_geometry(self.config, device=self.device)
         self.wls = self.geometry.wls if self.device_type == "wdm_1x2" else [self.config["wl"]]
 
         self.solvers = [HelmholtzSolver2D.from_args(self.config, geometry=self.geometry, wl_override=w) for w in self.wls]
         self.solver = self.solvers[0]  # Primary solver reference
-        self.criteria = [SplitterLoss(s, self.field_std, self.device) for s in self.solvers]
-
-        # Precompute normalized waveguide base template on device
-        eps_empty = self.geometry.make_eps(np.zeros(self.geometry.design_shape, dtype=np.float32))
-        eps_norm_empty = (eps_empty - self.geometry.eps_bg) / (self.geometry.eps_si - self.geometry.eps_bg)
-        self.base_eps_norm = torch.from_numpy(eps_norm_empty).float().to(self.device).unsqueeze(0).unsqueeze(0)
+        self.loss_fn = wdm_loss if self.device_type == "wdm_1x2" else splitter_loss
 
         self.x0, self.x1 = self.geometry.x0, self.geometry.x1
         self.y0, self.y1 = self.geometry.y0, self.geometry.y1
 
-        # Precompute circular Gaussian smoothing kernel
+        # Precompute circular Gaussian smoothing kernel on self.device
         k_rad = int(np.ceil(2.5 * smooth_sigma))
         coords = torch.arange(-k_rad, k_rad + 1, device=self.device, dtype=torch.float32)
         kx, ky = torch.meshgrid(coords, coords, indexing="ij")
@@ -49,18 +44,8 @@ class PhotonicFitter:
         self.smooth_kernel = (kernel / kernel.sum()).unsqueeze(0).unsqueeze(0)
         self.k_pad = k_rad
 
-        # Universal port pinning from geometry
-        self.pin, self.pin_z = self.geometry.get_pin_masks(n_pin=self.k_pad + 2, device=self.device)
-
-    @staticmethod
-    def _resolve_device(device_arg):
-        if device_arg != "auto":
-            return torch.device(device_arg)
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
+        # Universal port & corner pinning on self.device
+        self.pin, self.pin_z = self.geometry.get_pin_masks(n_pin=self.k_pad + 2, flare_margin=500)
 
     def evaluate(self, rho_np, solver=None):
         s = solver if solver is not None else self.solver
@@ -77,24 +62,24 @@ class PhotonicFitter:
         return torch.sigmoid(beta * (z_smooth + shift * (1.0 - self.pin)))
 
     def _assemble_eps_norm(self, rho):
-        eps = self.base_eps_norm.clone()
+        eps = self.geometry.base_eps_norm.clone()
         eps[0, 0, self.x0 : self.x1, self.y0 : self.y1] = rho
         return eps
 
     def _resolve_targets(self, target_ratio, target_ratios):
-        """Resolves per-wavelength target ratio vectors for 1x2, 1x3, or WDM."""
+        """Returns target ratio tensor of shape (n_wls, n_ports) on `self.device`."""
         if self.device_type == "wdm_1x2":
-            # Wavelength 0 -> Port 1 ([1, 0]), Wavelength 1 -> Port 2 ([0, 1])
-            return [[1.0, 0.0], [0.0, 1.0]]
-        if target_ratios is not None:
+            t_list = [[1.0, 0.0], [0.0, 1.0]]
+        elif target_ratios is not None:
             r = np.asarray(target_ratios, dtype=np.float32)
-            return [(r / r.sum()).tolist()]
-        if self.geometry.n_ports == 2:
+            t_list = [(r / r.sum()).tolist()]
+        elif self.geometry.n_ports == 2:
             tr = 0.5 if target_ratio is None else float(target_ratio)
-            return [[tr, 1.0 - tr]]
-        # Default equal split for 1xN (e.g. [1/3, 1/3, 1/3] for 1x3)
-        n = self.geometry.n_ports
-        return [[1.0 / n] * n]
+            t_list = [[tr, 1.0 - tr]]
+        else:
+            n = self.geometry.n_ports
+            t_list = [[1.0 / n] * n]
+        return torch.tensor(t_list, dtype=torch.float32, device=self.device)
 
     def fit(
         self,
@@ -106,29 +91,28 @@ class PhotonicFitter:
         init_mode="branched",
         symmetric=None,
         beta_start=1.5,
-        beta_end=12.0,
+        beta_end=16.0,
         robust_delta=0.0,
         robust_start=0.5,
     ):
         wl_targets = self._resolve_targets(target_ratio, target_ratios)
+        t0_np = wl_targets[0].cpu().numpy()
         if symmetric is None:
-            # Enforce y-symmetry automatically if targets are symmetric and not WDM
-            t0 = wl_targets[0]
-            symmetric = (self.device_type != "wdm_1x2") and np.allclose(t0, t0[::-1], atol=1e-3)
+            symmetric = (self.device_type != "wdm_1x2") and np.allclose(t0_np, t0_np[::-1], atol=1e-3)
 
-        z = self.geometry.init_latent(init_mode=init_mode, device=self.device).requires_grad_(True)
-        
+        z = self.geometry.init_latent(init_mode=init_mode).requires_grad_(True)
         optimizer = torch.optim.Adam([z], lr=lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=lr * 0.05)
 
-        history = {"loss": [], "powers": [], "total": [], "t1": [], "t2": [], "t1_surr": [], "t2_surr": [], "total_surr": []}
+        history = {"loss": [], "powers": [], "powers_all": [], "total": [], "t1": [], "t2": []}
         pbar = tqdm(range(1, steps + 1), desc=f"Fitting [{self.device_type}]")
 
+        wl_mean = float(np.mean(self.wls))
         t0 = time.perf_counter()
         for step in pbar:
             frac = min((step - 1) / max(0.75 * steps, 1), 1.0)
             beta = beta_start + (beta_end - beta_start) * (frac ** 1.5)
-            bin_weight = 0.01 + 0.08 * (frac ** 2)
+            bin_weight = 0.01 + 0.10 * (frac ** 2)
 
             optimizer.zero_grad()
             use_robust = robust_delta > 0 and step > robust_start * steps
@@ -139,39 +123,56 @@ class PhotonicFitter:
             for shift in shifts:
                 rho_s = self._project_density(z, beta=beta, symmetric=symmetric, shift=shift)
                 eps_in = self._assemble_eps_norm(rho_s)
-                for s_idx, (solver, criterion) in enumerate(zip(self.solvers, self.criteria)):
-                    field = solve_fdfd_differentiable(eps_in, solver, self.field_std)
-                    l, p_vec = criterion(
-                        field, rho_s, target_ratios=wl_targets[s_idx],
-                        total_target=total_target, bin_weight=bin_weight
+                pass_powers = []
+                for s_idx, solver in enumerate(self.solvers):
+                    field = solve_fdfd_differentiable(eps_in, solver)
+                    l, p_vec = self.loss_fn(
+                        field,
+                        rho_s,
+                        solver,
+                        targets=wl_targets[s_idx],
+                        total_target=total_target,
+                        bin_weight=bin_weight,
                     )
-                    loss = loss + l / (len(shifts) * len(self.solvers))
+                    # Compensate for k0^2 ~ 1/wl^2 adjoint scaling in multi-wavelength WDM
+                    wl_weight = (solver.wl / wl_mean) ** 2 if len(self.solvers) > 1 else 1.0
+                    loss = loss + (wl_weight * l) / (len(shifts) * len(self.solvers))
+                    pass_powers.append((p_vec * wl_targets[s_idx]).sum())
                     if shift == 0.0:
                         nom_powers.append(p_vec.detach().cpu().numpy())
+
+                # Explicitly penalize pass-port asymmetry between WDM channels
+                if len(pass_powers) > 1:
+                    loss = loss + 1.5 * ((pass_powers[0] - pass_powers[1]) ** 2) / len(shifts)
 
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            p0 = nom_powers[0]  # Primary wavelength port powers
-            tot_v = float(np.sum(p0))
+            p0 = nom_powers[0]
             history["loss"].append(loss.item())
             history["powers"].append(p0.tolist())
-            history["total"].append(tot_v)
+            history["powers_all"].append([p.tolist() for p in nom_powers])
             history["t1"].append(float(p0[0]))
             history["t2"].append(float(p0[1]))
-            history["t1_surr"].append(float(p0[0]))
-            history["t2_surr"].append(float(p0[1]))
-            history["total_surr"].append(tot_v)
 
-            ports_str = "/".join(f"{p*100:.1f}%" for p in p0)
+            if len(nom_powers) > 1:
+                tot_v = 0.5 * float(np.sum(nom_powers[0]) + np.sum(nom_powers[1]))
+                ports_str = f"λ1:{nom_powers[0][0]*100:.1f}%|λ2:{nom_powers[1][1]*100:.1f}%"
+            else:
+                tot_v = float(np.sum(p0))
+                ports_str = "/".join(f"{p*100:.1f}%" for p in p0)
+
+            history["total"].append(tot_v)
             pbar.set_postfix(Ports=ports_str, Tot=f"{tot_v*100:.1f}%", beta=f"{beta:.1f}")
 
         elapsed = time.perf_counter() - t0
 
         with torch.no_grad():
             rho_gray = self._project_density(z, beta=beta_end, symmetric=symmetric)
-            rho_bin_np = (rho_gray.cpu().numpy() > 0.5).astype(np.float32)
+            rho_bin_t = (rho_gray > 0.5).float()
+            rho_bin_np = rho_bin_t.cpu().numpy()
+            eps_norm_np = self._assemble_eps_norm(rho_bin_t).squeeze().cpu().numpy()
 
         Ez_list, powers_list = [], []
         for s in self.solvers:
@@ -180,12 +181,19 @@ class PhotonicFitter:
             powers_list.append(p_b)
 
         p_main = powers_list[0]
-        print(f" [{self.device_type} Fit in {elapsed:.1f}s] Ports: {[round(x*100, 1) for x in p_main]}%")
+        if len(powers_list) > 1:
+            msg = " | ".join(
+                f"λ={w:.2f}um: {[round(x*100, 1) for x in p]}%"
+                for w, p in zip(self.wls, powers_list)
+            )
+            print(f" [{self.device_type} Fit in {elapsed:.1f}s] {msg}")
+        else:
+            print(f" [{self.device_type} Fit in {elapsed:.1f}s] Ports: {[round(x*100, 1) for x in p_main]}%")
 
         return {
             "device_type": self.device_type,
             "rho": rho_bin_np,
-            "eps_norm": self._assemble_eps_norm(torch.from_numpy(rho_bin_np).to(self.device)).squeeze().cpu().numpy(),
+            "eps_norm": eps_norm_np,
             "Ez_fit": Ez_list[0],
             "Ez_all": Ez_list,
             "powers_fit": p_main,
@@ -194,7 +202,7 @@ class PhotonicFitter:
             "t2_fit": p_main[1],
             "z": z.detach().cpu(),
             "history": history,
-            "target_ratios": wl_targets[0],
-            "target_ratio": wl_targets[0][0],
+            "target_ratios": t0_np.tolist(),
+            "target_ratio": float(t0_np[0]),
             "elapsed_sec": elapsed,
         }

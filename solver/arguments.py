@@ -44,9 +44,9 @@ def get_args(device_type="splitter_1x2", custom_args=None):
     phys.add_argument("--wl", type=float, default=1.55, help="Single laser wavelength in microns")
     phys.add_argument("--wls", type=float, nargs="+", default=[1.55], help="Wavelengths list (used by WDM)")
     phys.add_argument("--npml", type=int, default=32, help="PML absorbing boundary thickness in pixels")
-    phys.add_argument("--pml-sigma-max", type=float, default=4.0, help="Dimensionless PML damping prefactor")
+    phys.add_argument("--pml-sigma-max", type=float, default=8.0, help="Dimensionless PML damping prefactor")
     phys.add_argument("--eps-bg", type=float, default=2.08, help="Background cladding permittivity (SiO2)")
-    phys.add_argument("--eps-si", type=float, default=7.84, help="Silicon core effective permittivity")
+    phys.add_argument("--eps-si", type=float, default=7.84, help="Silicon core effective permittivity at 1.55 um")
 
     phys.add_argument("--wg-half", type=int, default=10, help="Waveguide half-width in pixels (10 px = 200 nm)")
     phys.add_argument("--port-offset", type=int, default=36, help="Y-offset between adjacent output ports in pixels")
@@ -62,7 +62,6 @@ def get_args(device_type="splitter_1x2", custom_args=None):
     phys.add_argument("--ny", type=int, default=None, help="Total grid points along y (auto if None)")
 
     phys.add_argument("--src-amp", type=float, default=100.0, help="Amplitude scaling of line source")
-    phys.add_argument("--mode-waist-ratio", type=float, default=0.75, help="Gaussian mode waist relative to wg_half")
 
     # Inverse Design Optimization
     inv = parser.add_argument_group("Inverse Design")
@@ -72,9 +71,9 @@ def get_args(device_type="splitter_1x2", custom_args=None):
     inv.add_argument("--design-steps", type=int, default=200, help="Number of adjoint gradient steps")
     inv.add_argument("--design-lr", type=float, default=0.05, help="Learning rate for geometry optimization")
     inv.add_argument("--beta-start", type=float, default=1.5, help="Initial sigmoid projection steepness")
-    inv.add_argument("--beta-end", type=float, default=12.0, help="Final sigmoid projection steepness")
-    inv.add_argument("--smooth-sigma", type=float, default=3.0, help="Gaussian spatial filter sigma in pixels")
-    inv.add_argument("--device", type=str, default="auto", help="Compute device")
+    inv.add_argument("--beta-end", type=float, default=16.0, help="Final sigmoid projection steepness")
+    inv.add_argument("--smooth-sigma", type=float, default=4.0, help="Gaussian spatial filter sigma in pixels")
+    inv.add_argument("--device", type=str, default="cpu", help="Compute device")
     inv.add_argument("--results-dir", type=str, default="results", help="Directory for output plots")
 
     # 1. Apply preset defaults for the chosen device_type

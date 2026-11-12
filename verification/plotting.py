@@ -1,7 +1,9 @@
 """Plotting helpers for solved Helmholtz fields."""
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
+from solver.solver import HelmholtzSolver2D
 
 def plot_result(result):
     """Visualizes the optimized silicon topology, FDFD wavefield intensity, and convergence for 1xN splitters."""
@@ -143,3 +145,35 @@ def plot_wdm_result(result, fitter):
 
     plt.tight_layout()
     plt.show()
+
+
+def plot_spectrum(res,fitter, wl_min=1.20, wl_max=1.70, n_pts=30, in_db=False):
+        """
+        Sweeps wavelength across [wl_min, wl_max] on the final binary design `res["rho"]`
+        and plots the continuous transmission spectrum for each output port.
+        """
+        wls_sweep = np.linspace(wl_min, wl_max, n_pts)
+        port_traces = []
+        for w in tqdm(wls_sweep, desc="Sweeping Spectrum"):
+            s_w = HelmholtzSolver2D.from_args(fitter.config, geometry=fitter.geometry, wl_override=float(w))
+            _, p_w = fitter.evaluate(res["rho"], solver=s_w)
+            port_traces.append(p_w)
+
+        port_traces = np.array(port_traces)  # shape: (n_pts, n_ports)
+        fig, ax = plt.subplots(figsize=(7.5, 4.2))
+        colors = ["#2b5c8f", "#d95f02", "#7570b3"]
+
+        for p_idx in range(port_traces.shape[1]):
+            y_val = 10.0 * np.log10(np.clip(port_traces[:, p_idx], 1e-4, 1.0)) if in_db else port_traces[:, p_idx] * 100.0
+            ax.plot(wls_sweep, y_val, "-o", markersize=4, lw=2, color=colors[p_idx % len(colors)], label=f"Port {p_idx + 1}")
+
+        for w_design in fitter.wls:
+            ax.axvline(w_design, color="gray", ls="--", alpha=0.6, label=f"Design λ = {w_design:.2f} µm")
+
+        ax.set_xlabel("Wavelength λ (µm)")
+        ax.set_ylabel("Transmission (dB)" if in_db else "Guided Transmission (%)")
+        ax.set_title(f"Broadband Spectral Response [{fitter.device_type}]")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+        plt.show()
