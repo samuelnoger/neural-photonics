@@ -147,7 +147,7 @@ def plot_wdm_result(result, fitter):
     plt.show()
 
 
-def plot_spectrum(res,fitter, wl_min=1.20, wl_max=1.70, n_pts=30, in_db=False):
+def plot_spectrum(res,fitter, wl_min=1.20, wl_max=1.70, n_pts=40, in_db=False):
         """
         Sweeps wavelength across [wl_min, wl_max] on the final binary design `res["rho"]`
         and plots the continuous transmission spectrum for each output port.
